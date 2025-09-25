@@ -19,6 +19,7 @@ from typing import Type
 from .bacnet_utils import make_jsonable, _handle_bacnet_response
 from .cache_handler import (_clear_cache_for_device, _get_cached_object_list, _get_cache_stats,
                             load_cached_object_properties, save_object_properties)
+from .bacnet_broadcast import ExistingAppBroadcastWorkaround
 
 from bacpypes3.app import Application
 from bacpypes3.basetypes import DateTime, PropertyReference
@@ -600,50 +601,48 @@ class BACnet:
         return response  # TODO: Improve error handling.
     
     async def scan_subnet(self,
-                          network_str: str,
-                          whois_timeout: float = 3.0,
-                          port: int = 47808,
-                          low_id: int = 0,
-                          high_id: int = 4194303,
-                          enable_brute_force: bool = True,
-                          semaphore_limit: int = 20,
-                          max_duration: float = 280.0) -> list:
+                        network_str: str,
+                        whois_timeout: float = 3.0,
+                        port: int = 47808,
+                        low_id: int = 0,
+                        high_id: int = 4194303,
+                        enable_brute_force: bool = True,
+                        semaphore_limit: int = 20,
+                        max_duration: float = 280.0) -> list:
+        
         """
         Smart subnet scan with global cache-informed scanning and router discovery:
-          1. Router discovery (Who-Is-Router-To-Network)
-          2. First scan ALL cached device addresses globally (comprehensive discovery)
-          3. Directed broadcast Who-Is (subnet broadcast)
-          4. Limited broadcast Who-Is (255.255.255.255)
-          5. Brute force unicast sweep of remaining addresses (if enabled and needed)
-
+        1. Router discovery (Who-Is-Router-To-Network)
+        2. First scan ALL cached device addresses globally (comprehensive discovery)
+        3. Directed broadcast Who-Is (standard method, then workaround if needed)
+        4. Limited broadcast Who-Is (standard method, then workaround if needed)
+        5. Brute force unicast sweep of remaining addresses (if enabled and needed)
         Note: Step 2 now scans ALL cached devices from ANY network to build comprehensive
         network topology knowledge over time. Devices found on 130.20.24.0/24 will be
         checked when scanning 10.71.19.0/24, enabling cross-network discovery.
-
         Parameters (removed force_fresh_scan as scan is always real):
-          network_str        CIDR (e.g. 192.168.1.0/24)
-          whois_timeout      Seconds to wait per broadcast (wait_for timeout)
-          port               UDP BACnet port to target (default 47808)
-          low_id / high_id   Device instance range filter (default 0-4194303)
-          enable_brute_force Whether to fall back to per-host unicast if broadcasts find nothing
-          semaphore_limit    Concurrency for brute force sweep (default 20)
-          max_duration       Safety cap (seconds) for brute force phase (default 280)
+        network_str        CIDR (e.g. 192.168.1.0/24)
+        whois_timeout      Seconds to wait per broadcast (wait_for timeout)
+        port               UDP BACnet port to target (default 47808)
+        low_id / high_id   Device instance range filter (default 0-4194303)
+        enable_brute_force Whether to fall back to per-host unicast if broadcasts find nothing
+        semaphore_limit    Concurrency for brute force sweep (default 20)
+        max_duration       Safety cap (seconds) for brute force phase (default 280)
         Returns: list[device_dict]
         """
-
         start_time = time.time()
-
         try:
             net = ipaddress.IPv4Network(network_str, strict=False)
         except ValueError as e:
             _log.error(f"[scan_subnet] Invalid network string '{network_str}': {e}")
             return []
-
+        
         discovered: list[dict] = []
         seen_keys: set = set()
         scanned_ips: set = set()    # Track which IPs we've already scanned
         router_info = []    # Track discovered routers
-
+        broadcast_discovery = None  # Initialize broadcast workaround when needed
+        
         def add_devices(devs: list[dict] | None):
             if not devs:
                 return
@@ -663,13 +662,81 @@ class BACnet:
                         except ValueError:
                             pass
 
+        async def try_broadcast_methods(broadcast_addr: str, method_name: str):
+            """Try both standard and workaround broadcast methods using existing app"""
+            devices_found = 0
+            
+            # Method 1: Standard BACpypes3 who_is (may fail due to broadcast bug)
+            _log.debug(f"[scan_subnet] {method_name} (standard) -> {broadcast_addr}")
+            try:
+                resp = await asyncio.wait_for(self.who_is(low_id, high_id, broadcast_addr),
+                                            timeout=whois_timeout)
+                if resp:
+                    _log.debug(f"[scan_subnet] {method_name} (standard) found {len(resp)} devices")
+                    add_devices(resp)
+                    devices_found = len(resp)
+                else:
+                    _log.debug(f"[scan_subnet] {method_name} (standard) found no devices")
+            except asyncio.TimeoutError:
+                _log.debug(f"[scan_subnet] {method_name} (standard) timeout")
+            except Exception as e:
+                _log.debug(f"[scan_subnet] {method_name} (standard) error: {e}")
+            
+            # Method 2: Broadcast workaround using existing app
+            if devices_found < 2:  # Try workaround if standard method found few devices
+                _log.debug(f"[scan_subnet] {method_name} (workaround) -> {broadcast_addr}")
+                try:
+                    # Import the workaround
+                    try:
+                        from .bacnet_broadcast import ExistingAppBroadcastWorkaround
+                    except ImportError:
+                        from bacnet_broadcast import ExistingAppBroadcastWorkaround
+                    
+                    # Initialize workaround with existing app
+                    nonlocal broadcast_discovery
+                    if broadcast_discovery is None:
+                        broadcast_discovery = ExistingAppBroadcastWorkaround(self.app)  # Use existing app!
+                        await broadcast_discovery.initialize()
+                    
+                    # Use broadcast workaround
+                    broadcast_ip = broadcast_addr.split(':')[0]  # Remove port if present
+                    workaround_devices = await broadcast_discovery.discover_devices(
+                        broadcast_ip, 
+                        device_range=(low_id, high_id), 
+                        timeout=whois_timeout
+                    )
+                    
+                    if workaround_devices:
+                        _log.info(f"[scan_subnet] {method_name} (workaround) found {len(workaround_devices)} devices")
+                        # Convert to your format
+                        workaround_resp = []
+                        for device in workaround_devices:
+                            device_info = {
+                                "pduSource": device.source_address,
+                                "deviceIdentifier": ["device", device.device_instance],
+                                "maxAPDULengthAccepted": device.max_apdu_length,
+                                "segmentationSupported": device.segmentation_supported,
+                                "vendorID": device.vendor_id,
+                            }
+                            workaround_resp.append(device_info)
+                        add_devices(workaround_resp)
+                        devices_found += len(workaround_devices)
+                    else:
+                        _log.debug(f"[scan_subnet] {method_name} (workaround) found no devices")
+                        
+                except Exception as e:
+                    _log.debug(f"[scan_subnet] {method_name} (workaround) error: {e}")
+                    import traceback
+                    _log.debug(f"[scan_subnet] {method_name} (workaround) traceback: {traceback.format_exc()}")
+            
+            return devices_found
+
         # 1. Router discovery - Who-Is-Router-To-Network
         _log.debug(f"[scan_subnet] Starting router discovery for network {network_str}")
         try:
             if hasattr(self.app, 'nse'):
                 router_response = await asyncio.wait_for(self.app.nse.who_is_router_to_network(),
-                                                         timeout=whois_timeout)
-
+                                                        timeout=whois_timeout)
                 if router_response:
                     _log.info(f"[scan_subnet] Found {len(router_response)} router responses")
                     for adapter, i_am_router_to_network in router_response:
@@ -677,32 +744,28 @@ class BACnet:
                         networks = [str(net)
                                     for net in i_am_router_to_network.iartnNetworkList] if hasattr(
                                         i_am_router_to_network, 'iartnNetworkList') else []
-
                         router_entry = {
                             'router_address': router_address,
                             'networks': networks,
                             'adapter': str(adapter) if adapter else None
                         }
                         router_info.append(router_entry)
-
                         _log.debug(
                             f"[scan_subnet] Router at {router_address} serves networks: {networks}"
                         )
-
                         # Try to extract IP from router address and scan it for devices
                         try:
                             if ':' in router_address:
                                 router_ip = router_address.split(':')[0]
                             else:
                                 router_ip = router_address
-
                             # Check if router IP is in our target network
                             router_ip_obj = ipaddress.IPv4Address(router_ip)
                             if router_ip_obj in net:
                                 # Scan the router itself for BACnet devices
                                 dest = f"{router_ip}:{port}"
                                 resp = await asyncio.wait_for(self.who_is(low_id, high_id, dest),
-                                                              timeout=whois_timeout)
+                                                            timeout=whois_timeout)
                                 if resp:
                                     _log.debug(f"[scan_subnet] Found devices on router {dest}")
                                     add_devices(resp)
@@ -711,7 +774,6 @@ class BACnet:
                                 f"[scan_subnet] Could not scan router {router_address}: {e}")
                 else:
                     _log.debug("[scan_subnet] No routers responded to Who-Is-Router-To-Network")
-
         except (AttributeError, asyncio.TimeoutError) as e:
             _log.debug(f"[scan_subnet] Router discovery failed or timed out: {e}")
         except Exception as e:
@@ -723,7 +785,6 @@ class BACnet:
             _log.info(
                 f"[scan_subnet] Found {len(cached_devices)} global cached devices, scanning them first for comprehensive discovery"
             )
-
             # Extract unique IP addresses from ALL cached devices (global discovery approach)
             cached_ips = set()
             for device in cached_devices:
@@ -736,75 +797,55 @@ class BACnet:
                         cached_ips.add(ip_obj)
                     except ValueError:
                         continue
-
             # Scan cached IPs with higher concurrency since they're likely to respond
             if cached_ips:
                 _log.debug(
                     f"[scan_subnet] Scanning {len(cached_ips)} global cached device IPs for comprehensive discovery"
                 )
                 sem_cached = asyncio.Semaphore(min(len(cached_ips),
-                                                   50))    # Higher concurrency for cached
-
+                                                50))    # Higher concurrency for cached
                 async def probe_cached(ip_obj):
                     async with sem_cached:
                         dest = f"{ip_obj}:{port}"
                         try:
                             resp = await asyncio.wait_for(self.who_is(low_id, high_id, dest),
-                                                          timeout=whois_timeout)
+                                                        timeout=whois_timeout)
                             if resp:
                                 _log.debug(f"[scan_subnet] Cached device verified at {dest}")
                                 add_devices(resp)
                         except Exception:
                             pass    # Cache miss is fine, device may have moved
-
                 cached_tasks = [asyncio.create_task(probe_cached(ip)) for ip in cached_ips]
                 if cached_tasks:
                     await asyncio.gather(*cached_tasks, return_exceptions=True)
-
                 _log.info(
                     f"[scan_subnet] Global cached scan complete: {len(discovered)} devices verified from comprehensive discovery"
                 )
 
-        # 3. Directed broadcast
+        # 3. Directed broadcast (try both standard and workaround methods)
         directed_broadcast = f"{net.broadcast_address}:{port}"
-        _log.debug(f"[scan_subnet] Directed broadcast Who-Is -> {directed_broadcast}")
-        try:
-            resp = await asyncio.wait_for(self.who_is(low_id, high_id, directed_broadcast),
-                                          timeout=whois_timeout)
-            add_devices(resp)
-        except asyncio.TimeoutError:
-            _log.debug("[scan_subnet] Directed broadcast timeout (continuing)")
-        except Exception as e:
-            _log.debug(f"[scan_subnet] Directed broadcast error: {e}")
+        directed_found = await try_broadcast_methods(directed_broadcast, "Directed broadcast")
 
         # 4. Limited broadcast if we haven't found many devices yet
         if len(discovered) < 5:    # Arbitrary threshold - adjust as needed
             limited_broadcast = f"255.255.255.255:{port}"
-            _log.debug(f"[scan_subnet] Limited broadcast Who-Is -> {limited_broadcast}")
-            try:
-                resp = await asyncio.wait_for(self.who_is(low_id, high_id, limited_broadcast),
-                                              timeout=whois_timeout)
-                add_devices(resp)
-            except asyncio.TimeoutError:
-                _log.debug("[scan_subnet] Limited broadcast timeout (continuing)")
-            except Exception as e:
-                _log.debug(f"[scan_subnet] Limited broadcast error: {e}")
+            limited_found = await try_broadcast_methods(limited_broadcast, "Limited broadcast")
+        else:
+            _log.debug("[scan_subnet] Skipping limited broadcast - sufficient devices found")
 
         # 5. Brute force unicast sweep of remaining addresses (skip already scanned IPs)
-        if enable_brute_force:
+        # Only do brute force if broadcast methods found very few devices
+        if enable_brute_force and len(discovered) < 3:  # Adjust threshold as needed
             remaining_hosts = [ip for ip in net.hosts() if ip not in scanned_ips]
             host_count = len(remaining_hosts)
-
             if host_count > 0:
                 if host_count > 1024:
                     _log.warning(
                         f"[scan_subnet] Large network sweep: {host_count} remaining hosts")
-
                 _log.debug(
                     f"[scan_subnet] Starting unicast sweep over {host_count} remaining hosts, port={port}, concurrency={semaphore_limit}"
                 )
                 sem = asyncio.Semaphore(semaphore_limit)
-
                 async def probe(ip_obj):
                     async with sem:
                         if time.time() - start_time > max_duration:
@@ -818,18 +859,20 @@ class BACnet:
                                 add_devices(resp)
                         except Exception:
                             pass    # per-host errors are non-fatal
-
                 tasks = []
                 for host_ip in remaining_hosts:
                     if time.time() - start_time > max_duration:
                         _log.warning("[scan_subnet] Time limit reached; stopping sweep early")
                         break
                     tasks.append(asyncio.create_task(probe(host_ip)))
-
                 if tasks:
                     await asyncio.gather(*tasks, return_exceptions=True)
             else:
                 _log.debug("[scan_subnet] No remaining hosts to scan after cache verification")
+        elif enable_brute_force:
+            _log.debug(f"[scan_subnet] Skipping brute force - broadcast methods found {len(discovered)} devices")
+        else:
+            _log.debug("[scan_subnet] Brute force disabled")
 
         # Save all discovered devices to cache with router information
         for device in discovered:
@@ -842,7 +885,7 @@ class BACnet:
         _log.info(
             f"[scan_subnet] Complete devices_found={len(discovered)} routers_found={len(router_info)} elapsed={elapsed:.2f}s"
         )
-
+        
         # Log router summary
         if router_info:
             _log.info(f"[scan_subnet] Router summary:")
