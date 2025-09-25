@@ -33,7 +33,7 @@ ignore_missing_imports = true
 [tool.poetry]
 name = "protocol-proxy-bacnet"
 version = "2.0.0rc0"
-description = "Volttron BACnet Protocol Proxy implementation for the VOLTTRON platform. A BACnet Manager is provided which can launch proxy devices for communication with a BACnet network."
+description = "A BACnet Protocol Proxy implementation. A BACnet Manager is provided which can launch proxy devices for communication with a BACnet network."
 authors = ["The VOLTTRON Development Team <volttron@pnnl.gov>"]
 license = "Apache License 2.0"
 readme = "README.md"
