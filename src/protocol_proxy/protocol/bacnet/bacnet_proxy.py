@@ -735,45 +735,51 @@ class BACnet:
         _log.debug(f"[scan_subnet] Starting router discovery for network {network_str}")
         try:
             if hasattr(self.app, 'nse'):
-                router_response = await asyncio.wait_for(self.app.nse.who_is_router_to_network(),
-                                                        timeout=whois_timeout)
-                if router_response:
-                    _log.info(f"[scan_subnet] Found {len(router_response)} router responses")
-                    for adapter, i_am_router_to_network in router_response:
-                        router_address = str(i_am_router_to_network.pduSource)
-                        networks = [str(net)
-                                    for net in i_am_router_to_network.iartnNetworkList] if hasattr(
-                                        i_am_router_to_network, 'iartnNetworkList') else []
-                        router_entry = {
-                            'router_address': router_address,
-                            'networks': networks,
-                            'adapter': str(adapter) if adapter else None
-                        }
-                        router_info.append(router_entry)
-                        _log.debug(
-                            f"[scan_subnet] Router at {router_address} serves networks: {networks}"
-                        )
-                        # Try to extract IP from router address and scan it for devices
-                        try:
-                            if ':' in router_address:
-                                router_ip = router_address.split(':')[0]
-                            else:
-                                router_ip = router_address
-                            # Check if router IP is in our target network
-                            router_ip_obj = ipaddress.IPv4Address(router_ip)
-                            if router_ip_obj in net:
-                                # Scan the router itself for BACnet devices
-                                dest = f"{router_ip}:{port}"
-                                resp = await asyncio.wait_for(self.who_is(low_id, high_id, dest),
+                try:
+                    router_response = await asyncio.wait_for(self.app.nse.who_is_router_to_network(),
                                                             timeout=whois_timeout)
-                                if resp:
-                                    _log.debug(f"[scan_subnet] Found devices on router {dest}")
-                                    add_devices(resp)
-                        except (ValueError, asyncio.TimeoutError) as e:
+                    if router_response:
+                        _log.info(f"[scan_subnet] Found {len(router_response)} router responses")
+                        for adapter, i_am_router_to_network in router_response:
+                            router_address = str(i_am_router_to_network.pduSource)
+                            networks = [str(net)
+                                        for net in i_am_router_to_network.iartnNetworkList] if hasattr(
+                                            i_am_router_to_network, 'iartnNetworkList') else []
+                            router_entry = {
+                                'router_address': router_address,
+                                'networks': networks,
+                                'adapter': str(adapter) if adapter else None
+                            }
+                            router_info.append(router_entry)
                             _log.debug(
-                                f"[scan_subnet] Could not scan router {router_address}: {e}")
-                else:
-                    _log.debug("[scan_subnet] No routers responded to Who-Is-Router-To-Network")
+                                f"[scan_subnet] Router at {router_address} serves networks: {networks}"
+                            )
+                            # Try to extract IP from router address and scan it for devices
+                            try:
+                                if ':' in router_address:
+                                    router_ip = router_address.split(':')[0]
+                                else:
+                                    router_ip = router_address
+                                # Check if router IP is in our target network
+                                router_ip_obj = ipaddress.IPv4Address(router_ip)
+                                if router_ip_obj in net:
+                                    # Scan the router itself for BACnet devices
+                                    dest = f"{router_ip}:{port}"
+                                    resp = await asyncio.wait_for(self.who_is(low_id, high_id, dest),
+                                                                timeout=whois_timeout)
+                                    if resp:
+                                        _log.debug(f"[scan_subnet] Found devices on router {dest}")
+                                        add_devices(resp)
+                            except (ValueError, asyncio.TimeoutError) as e:
+                                _log.debug(
+                                    f"[scan_subnet] Could not scan router {router_address}: {e}")
+                    else:
+                        _log.debug("[scan_subnet] No routers responded to Who-Is-Router-To-Network")
+                except RuntimeError as e:
+                    if "no broadcast" in str(e).lower():
+                        _log.debug(f"[scan_subnet] Router discovery skipped - broadcast not available in this environment (WSL2/virtualized network): {e}")
+                    else:
+                        _log.warning(f"[scan_subnet] Router discovery failed with RuntimeError: {e}")
         except (AttributeError, asyncio.TimeoutError) as e:
             _log.debug(f"[scan_subnet] Router discovery failed or timed out: {e}")
         except Exception as e:
