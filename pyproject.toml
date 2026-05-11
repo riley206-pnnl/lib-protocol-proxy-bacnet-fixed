@@ -58,6 +58,7 @@ psutil = ">=5.9.0,<8.0.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = ">=8.0,<10.0"
+tomli = { version = ">=2.0.0", python = "<3.11" }
 
 [tool.poetry.scripts]
 bacnet-scan = "protocol_proxy.protocol.bacnet.tools.scan:main"

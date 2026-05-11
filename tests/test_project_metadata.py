@@ -1,5 +1,9 @@
-import tomllib
 from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
 
 
 def test_dev_dependencies_include_pytest():
